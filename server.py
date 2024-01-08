@@ -1,76 +1,61 @@
-import random
 import socket
-import os
-import sys
-import time
+import utils
+from utils import States
 
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5005
 
-# Server file which will send files to the clients
+# initial server_state
+server_state = States.CLOSED
 
+sock = socket.socket(socket.AF_INET,    # Internet
+                     socket.SOCK_DGRAM) # UDP
 
-def send_file_to_clients(file_name, probability, window_size):
-    # Open the file to be sent
-    with open(file_name, "rb") as file:
-        file_data = file.read()
+sock.bind((UDP_IP, UDP_PORT)) # wait for connection
 
-    # Create UDP socket
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # Set adress
-    server_address = ('localhost', 12345)
-    # Bind the socket to the adress to listen for packets
-    server_socket.bind(server_address)
+# Some helper functions to keep the code clean and tidy
+def update_server_state(new_state):
+  global server_state
+  if utils.DEBUG:
+    print(server_state, '->', new_state)
+  server_state = new_state
 
-    # Tracking clients
-    clients = set()  # List of clients
-    num_clients = 0  # Track the number of connected clients
-    expected_clients = int(number_of_processes)  # Total number of expected clients
-    # In case of an error
-    server_socket.settimeout(10.0)
+# Receive a message and return header, body and addr
+# addr is used to reply to the client
+# this call is blocking
+def recv_msg():
+  data, addr = sock.recvfrom(1024)
+  header = utils.bits_to_header(data)
+  body = utils.get_body_from_data(data)
+  return (header, body, addr)
 
-    # Joining of the clients
-    print("Waiting for all clients to join...")
+# the server runs in an infinite loop and takes
+# action based on current state and updates its state
+# accordingly
+# You will need to add more states, please update the possible
+# states in utils.py file
+while True:
+  if server_state == States.CLOSED:
+    # we already started listening, just update the state
+    update_server_state(States.LISTEN)
+  elif server_state == States.LISTEN:
+    # we are waiting for a message
+    header, body, addr = recv_msg()
+    # if received message is a syn message, it's a connection
+    # initiation
+    if header.syn == 1:
+      seq_number = utils.rand_int() # we randomly pick a sequence number
+      ack_number = header.seq_num + 1
+      # to be implemented
 
-    while num_clients < expected_clients:
-        try:
-            # Get confirmation that client wants to join
-            data, client_address = server_socket.recvfrom(4096)
-            # Add new client
-            if client_address not in clients:
-                clients.add(client_address)
-                num_clients += 1
-                print(f"Client {num_clients} connected: {client_address}")
-        except socket.timeout:
-            print("Timeout occurred. No more clients joining or data received within the timeout.")
-            break
+      ### sending message from the server:
+      #   use the following method to send messages back to client
+      #   addr is recieved when we receive a message from a client (see above)
+      #   sock.sendto(your_header_object.bits(), addr)
 
-    print("All clients have joined. Initiating file transfer...")
-
-    # Send the file data to all connected clients
-    # Sending the data
-    while file_data:
-        chunk = file_data[:window_size]  # Extract data chunk
-        file_data = file_data[window_size:]  # Move to the next chunk
-
-        for client_address in clients:
-            if probability > random.random():  # Simulate probability of success by comparint pb with random number 0-1
-                server_socket.sendto(chunk, client_address)
-            else :
-                # If mamy issue to sleep 5 seconds and resend
-                time.sleep(5)
-                server_socket.sendto(chunk, client_address)
-
-    # Close server socket
-    server_socket.close()
-    print("File sent to all clients.")
-
-if __name__ == "__main__":
-
-    toolname = sys.argv[1]
-    id_process = sys.argv[2]
-    number_of_processes = sys.argv[3]
-    file_name = sys.argv[4]
-    probability = float(sys.argv[5])
-    protocol = sys.argv[6]
-    window_size = int(sys.argv[7])
-
-    send_file_to_clients(file_name, probability, window_size)
+  elif server_state == States.SYN_RECEIVED:
+    pass
+  elif server_state == States.SYN_SENT:
+    pass
+  else:
+    pass
