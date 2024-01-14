@@ -1,6 +1,7 @@
 # imported modules
 import socket               # Python implementation of Berkeley Software Distribution (BSD) socket interface
 import sys
+import threading
 import unreliable_network
 
 
@@ -17,6 +18,42 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
     :param window_size: size of sliding window
     :return: None
     """
+
+    ################################################################################################################
+    # file chunking part
+
+    # dummy files for testing purposes were generated via UNIX "dd" command (with size=50 for 50MB and =1000 for 1GB):
+    # dd if=/dev/urandom (random source generator) of=dummy_file_<size>MB.txt (destination file)
+    #    bs=1000000 (block size in bytes) count=<size> (how many read/write operations from source to destination)
+    ################################################################################################################
+
+    # use Python function open() to read data ("r") in binary/byte mode ("b") from file with specified file name
+    with open(file_name, "rb") as download_file:
+        # read data from file object "download_file" into bytes object "file_data"
+        file_data = download_file.read()
+
+        # prepare file data chunks to be transmitted to client processes
+        data_chunks = list()
+        for byte in range(0, len(file_data), 5000):
+            # append file byte data chunks of 5KB size to list
+            bulk_slicing = slice(byte, byte + 5000)
+            data_chunks.append(file_data[bulk_slicing])
+
+            # slicing of file data into equally sized parts may not be possible, last file chunk may be smaller
+            if (byte + 5000) + 5000 >= len(file_data):
+                end_slicing = slice(byte + 5000, len(file_data))
+                data_chunks.append(file_data[end_slicing])
+
+        # attribute sequence number to each file data chunk for pipelining mechanism (indexing)
+        sequenced_data_chunks = list()
+        sequence_number = 0
+        for chunk in data_chunks:
+            sequenced_data_chunks.append((sequence_number, data_chunks[sequence_number]))
+            sequence_number += 1
+
+    ################################################################################################################
+    # bootstrapping downloading clients
+    ################################################################################################################
 
     # for security & demonstration reasons, server address is IPv4 loopback address (inaccessible to outer networks)
     # IPv4 address used instead of "localhost" domain to avoid non-deterministic behaviour through DNS resolution
@@ -62,42 +99,15 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
     print(f"All clients registered at server {process_id}. Initiating transfer of file '{file_name}' ...")
 
     ################################################################################################################
-    # dummy files for testing purposes were generated via UNIX "dd" command (with size=50 for 50MB and =1000 for 1GB):
-    # dd if=/dev/urandom (random source generator) of=dummy_file_<size>MB.txt (destination file)
-    #    bs=1000000 (block size in bytes) count=<size> (how many read/write operations from source to destination)
+    # handling retransmissions differently depending on pipelining mechanism
     ################################################################################################################
 
-    # use Python function open() to read data ("r") in binary/byte mode ("b") from file with specified file name
-    with open(file_name, "rb") as download_file:
-        # read data from file object "download_file" into bytes object "file_data"
-        file_data = download_file.read()
-
-        # prepare file data chunks to be transmitted to client processes
-        data_chunks = list()
-        for byte in range(0, len(file_data), 5000):
-            # append file byte data chunks of 5KB size to list
-            bulk_slicing = slice(byte, byte + 5000)
-            data_chunks.append(file_data[bulk_slicing])
-
-            # slicing of file data into equally sized parts may not be possible, last file chunk may be smaller
-            if (byte + 5000) + 5000 >= len(file_data):
-                end_slicing = slice(byte + 5000, len(file_data))
-                data_chunks.append(file_data[end_slicing])
-
-        # attribute sequence number to each file data chunk for pipelining mechanism (indexing)
-        sequenced_data_chunks = list()
-        sequence_number = 0
-        for chunk in data_chunks:
-            sequenced_data_chunks.append((sequence_number, data_chunks[sequence_number]))
-            sequence_number += 1
-
-    # handle retransmissions differently depending on pipelining mechanism
     # Go-Back-N pipelining
     if pipeline_type == "gbn":
         # initialise parameters of sender sliding window
         window_base = 0
-        sequence_number_to_send = 0
-        window_end = min(window_base + window_size - 1, len(sequenced_data_chunks))
+        next_sequence_number = 1
+        window_end = min(window_base + window_size - 1, len(sequenced_data_chunks) - 1)
 
         # keep track whether all clients have acknowledged given sequence number (synchronisation) via dictionary
         last_ack_rcvd_from_client = dict()
@@ -105,10 +115,62 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
             last_ack_rcvd_from_client[client] = 0
 
         # Go-Back-N communication loop (file transmission)
-        while window_base <= len(sequenced_data_chunks):
+        while window_base <= len(sequenced_data_chunks) - 1:
 
-            # sending of messages with sequence numbers in current sender window
-            for sqn_nrs in range(window_base, window_end + 1):
+            #####################################################################################################
+            # sending part of server Go-Back-N
+            #####################################################################################################
+
+            # iteratively sending each message with sequence number in current sender window...
+            for sqn_nr in range(window_base, window_end + 1):
+                # ...to all clients registered at the server
+                for registered_client in registered_clients_addr:
+                    # construct segment payload, packaged with checksum and sequence number metadata (pseudo-header)
+                    sender_checksum = unreliable_network.checksum(
+                                        sqn_nr.to_bytes(1, byteorder=sys.byteorder) + data_chunks[sqn_nr]).encode()
+                    encoded_sqn_nr = sqn_nr.to_bytes(1, byteorder=sys.byteorder)
+                    byte_message = (sender_checksum + ":".encode() +
+                                    encoded_sqn_nr + ":".encode()
+                                    + data_chunks[sqn_nr])
+
+                    # transmit same-sequence-number message via underlying (unreliable) network stack to all clients
+                    unreliable_network.prob_send(server_socket, byte_message, registered_client, failure_probability)
+                    print(f"Sent file data chunk {sqn_nr}/{len(data_chunks)} to client {registered_client[0]}:{registered_client[1]}")
+
+                    # for each client, start timer for each message
+                    # -> expiration of message-related timer (timeout event) will trigger retransmission of ALL
+                    #    messages, i.e. the timed-out message and all other messages in the consecutive window
+                    # -> arrival of ACK before timeout resets timeout for next message burst
+                    client_timer = threading.Timer(10, retransmission)
+                    client_timer.start()
+                    # TODO: implement method and provide maybe args and kwargs !!!!!!!!!!!!!!!!!!
+                    # but do only include in retransmission() the clients which did not receive an acknowledgment!
+
+            #####################################################################################################
+            # receiving part of server Go-Back-N
+            #####################################################################################################
+
+            # handling of acknowledgment messages from registered client processes
+            client_message_data, ack_client_addr = server_socket.recvfrom(4096)
+
+            # analyse content of client message
+            client_message_fields = client_message_data.decode().split(":", 2)
+            sender_checksum = client_message_fields[0]
+            ack_sqn_nr = client_message_fields[1]
+
+            recv_checksum = unreliable_network.checksum(ack_sqn_nr.encode() + client_message_fields[2].encode())
+            # check whether ACK message was not corrupted by unreliable network channel...
+            if sender_checksum == recv_checksum:
+                # ... if ACK message was not corrupted, acknowledge every message up to the acknowledged number
+                # (Go-Back-N uses cumulative acknowledgments scheme)
+                for client in last_ack_rcvd_from_client:
+                    if client == ack_client_addr:
+                        last_ack_rcvd_from_client[ack_client_addr] = int(ack_sqn_nr)
+
+            # check after each message burst whether all clients have received a certain sequence number
+            isSynchronised = False
+
+            # TODO: check in last_ack_rcvd_from_client whether all clients got the same packet to advance sender window
 
 
 
