@@ -42,7 +42,7 @@ def checksum(byte_data):
     binary_chunks = []
 
     if len(binary_data) % 16 != 0:
-        # pad leading bits with 0's to obtain a 16-bit block if chunking into equally sized 16-bit blocks not possible
+        # pad leading bits with 0's to obtain first 16-bit block if perfect chunking into 16-bit blocks not possible
         remaining_bits_padded = "0" * (16 - len(binary_data) % 16)
         remaining_bits_padded = remaining_bits_padded + binary_data[0:len(binary_data) % 16]
         binary_chunks.append(remaining_bits_padded)
@@ -57,14 +57,11 @@ def checksum(byte_data):
     # sum up individual binary number strings in list as integers, then convert back to binary (without "0b" prefix)
     binary_sum = bin(sum(int(x, 2) for x in binary_chunks))[2:]
 
-    # possible carry wrap-around (remove 16-bit-overflowing carry bits and add them to 16-bit register)
+    # possible carry wrap-around (remove possible 16-bit-overflowing carry bit and add it back to 16-bit register)
     if len(binary_sum) > 16:
-        # identify number of overflowing bits
-        overflow_length = len(binary_sum) - 16
-
-        # add them back to 16-bit register via binary addition
-        binary_sum = bin(int(binary_sum[0:overflow_length], 2) + int(binary_sum[overflow_length:], 2))[2:]
-    # or padding with 0's if cumulative binary sum above has leading 0's in 16-bit register (important for next step)
+        # add back to 16-bit register via binary addition
+        binary_sum = bin(int(binary_sum[0], 2) + int(binary_sum[1:], 2))[2:]
+    # or padding with 0's if cumulative binary sum above would have leading 0's in 16-bit register
     elif len(binary_sum) < 16:
         binary_sum = "0" * (16 - len(binary_sum)) + binary_sum
 

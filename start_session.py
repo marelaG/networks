@@ -15,12 +15,12 @@ def main():
     window_size = int(sys.argv[6])
 
     # start server child process from this parent process (here)
-    server_process = subprocess.Popen(["python", "server_process.py",
+    server_process = subprocess.Popen(["python3", "server_process.py",
                                        id_process, number_of_processes, filename, probability, protocol, window_size])
 
     # start client child process(es) from this parent process (here)
     for client_instance in range(number_of_processes):
-        client_process = subprocess.Popen(["python", "client_process.py",
+        client_process = subprocess.Popen(["python3", "client_process.py",
                                            filename, probability, protocol, window_size])
 
     # wait until server process has completed file transmission to ALL child processes before application shutdown
