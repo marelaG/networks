@@ -47,15 +47,73 @@ def run_client(filename, failure_probability, protocol, window_size, file_bytes_
     # Go-Back-N receiver-side implementation
     #############################################################################################################
 
-    # client process tracks next in-order sequence number expected to be sent by server process (Go-Back-N sender)
+    # each client process tracks next in-order sequence number expected to be sent by server process (Go-Back-N sender)
     receiver_base = 0
 
-    HERE !
+    # Go-Back-N (bidirectional) communication loop for file receipt and ACKs
+    download_ongoing = True
+    while download_ongoing:
+        # receive incoming packet data sent by contacted server
+        received_data, server_address = client_socket.recvfrom(4096)
 
-    # !!! -> implementation choice: no buffering of sequence numbers higher than next-highest, in-order
+        # analyse content of received data
+        server_message_fields = received_data.decode().split(":", 2)
+        sender_checksum = server_message_fields[0]
+        sequence_number_field = server_message_fields[1].split(",")
+        sequence_number = sequence_number_field[0]
+        server_payload = server_message_fields[2]
+
+        # check whether server message was not corrupted by unreliable network channel
+        receiver_checksum = unreliable_network.checksum(sequence_number.encode() + server_payload.encode())
+
+        if sender_checksum == receiver_checksum:
+            # client reaction depending on received sequence number (and message content in case of completed download)
+            if int(sequence_number) == receiver_base:
+                # client receives expected sequence number -> acknowledge receipt by advancing client sliding window...
+                receiver_base += 1
+
+                # ... and sending ACK message to server for this sequence number
+                acked_sequence_number = int(sequence_number).to_bytes(1, byteorder=sys.byteorder)
+                ack_payload = "ACK".encode()
+                ack_checksum = unreliable_network.checksum(acked_sequence_number + ack_payload).encode()
+                byte_ack_message = ack_checksum + ":".encode() + acked_sequence_number + ":".encode() + ack_payload
+
+                # try sending ACK message via underlying (unreliable) network to client
+                was_acked = unreliable_network.prob_send(client_socket, byte_ack_message, server_address, failure_probability)
+
+                # if ACK sending was successful, update receiving statistics
+                if was_acked:
+                    # if received file data was transmitted first time by server
+                    if len(sequence_number_field) == 1:
+                        file_bytes_received += len(server_payload.encode())
+                        packets_received += 1
+                    # if received message was re-transmitted by server
+                    elif len(sequence_number_field) > 1:
+                        retransmitted_file_bytes_received += len(server_payload.encode())
+                        retransmitted_packets_received += 1
+
+            elif (int(sequence_number) > receiver_base) and (int(sequence_number) <= receiver_base + window_size - 1):
+                # received sequence number lies in Go-Back-N receiver window, BUT is not expected sequence number
+                # -> client then acknowledges highest IN-ORDER, YET-RECEIVED sequence number receiver_base–1 to server
+                # -> personal choice: NO buffering of received sequence numbers higher than receiver_base in window
+
+                # send (duplicate) ACK message to server with receiver_base–1 as sequence number
+                acked_sequence_number = int(receiver_base - 1).to_bytes(1, byteorder=sys.byteorder)
+                ack_payload = "ACK".encode()
+                ack_checksum = unreliable_network.checksum(acked_sequence_number + ack_payload).encode()
+                byte_ack_message = ack_checksum + ":".encode() + acked_sequence_number + ":".encode() + ack_payload
+
+                # try sending (duplicate) ACK via underlying (unreliable) network to client
+                unreliable_network.prob_send(client_socket, byte_ack_message, server_address, failure_probability)
+
+            elif int(sequence_number) == 12345:
+                # upon receiving this particular sequence number, server indicates to client that download is complete
+                download_ongoing = False
+                break
 
     # release system resources by closing socket after file transmission completed and communicate statistics
     client_socket.close()
+    print("")
     print(f"--------------------------------------------------------------------------------------------")
     print(f"--------------------------------------------------------------------------------------------")
     print(f"File '{file_name}' has been downloaded by client at {client_ip}:{client_port}.")

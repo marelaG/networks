@@ -1,7 +1,7 @@
 # imported modules
 import socket               # Python implementation of Berkeley Software Distribution (BSD) socket interface
 import sys
-import threading            # module for thread-based parallelism (no true concurrency due to Global Interpreter Lock)
+import threading            # module for thread-based parallelism (NO true concurrency due to Global Interpreter Lock)
 import unreliable_network
 
 
@@ -18,28 +18,28 @@ def retransmission_handler_gbn(server_socket, failure_probability, registered_cl
     :return: None
     """
 
-    # if client-specific packet timer expires and packet was already ACKed by client to server, no action needed
+    # if client-specific packet timer expires and packet was already ACKed by client, no action needed
     if last_ack_rcvd_from_client[registered_client] >= sqn_nr:
         return
 
     # if client-specific timer for packet n expires, retransmit all packets from sequence number n to current window end
     else:
         for packet_nr in range(sqn_nr, window_end + 1):
-            # construct segment payload, packaged with checksum and sequence number metadata (pseudo-header)
-            sender_checksum = (unreliable_network.checksum(packet_nr.to_bytes(1, byteorder=sys.byteorder) +
-                                                           data_chunks[packet_nr]).encode())
+            # packet construction
+            # -> package payload with checksum and sequence number metadata (pseudo-headers)
             encoded_sqn_nr = packet_nr.to_bytes(1, byteorder=sys.byteorder)
-            # indicate after sequence number that it is a re-transmitted packet by appending "R"
+            sender_checksum = unreliable_network.checksum(encoded_sqn_nr + data_chunks[packet_nr]).encode()
+            # -> indicate in sequence number field that it is a re-transmitted packet by appending ",R"
             byte_message = (sender_checksum + ":".encode() +
-                            encoded_sqn_nr + "R:".encode()
+                            encoded_sqn_nr + ",R:".encode()
                             + data_chunks[packet_nr])
 
-            # try resending sequenced packet(s) via underlying (unreliable) network stack to client
+            # try resending prepared packet via underlying (unreliable) network to client
             was_sent = unreliable_network.prob_send(server_socket, byte_message, registered_client, failure_probability)
 
             # if packet retransmission was successful, update sending statistics
             if was_sent:
-                print(f"RESENT FILE DATA CHUNK {sqn_nr}/{len(data_chunks)} "
+                print(f"RESENT FILE DATA CHUNK {packet_nr}/{len(data_chunks)} "
                       f"TO CLIENT {registered_client[0]}:{registered_client[1]}.")
                 file_bytes_retransmitted += len(data_chunks[packet_nr])
                 packets_retransmitted += 1
@@ -50,7 +50,7 @@ def retransmission_handler_gbn(server_socket, failure_probability, registered_cl
 def run_server(process_id, expected_clients_nr, file_name, failure_probability, pipeline_type, window_size,
                file_bytes_sent, packets_sent, file_bytes_retransmitted, packets_retransmitted):
     """
-    Runs server process for synchronously transmitting file to multiple client processes with simulated network
+    Runs server process for synchronously transmitting a file to multiple client processes with simulated network
     unreliability and using the specified pipelining mechanism
 
     :param process_id: identification number for transmission session process
@@ -150,7 +150,7 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
         window_end = min(window_base + window_size - 1, len(data_chunks) - 1)
 
         # keep track what is the highest, in-order (!!!) sequence number each client has respectively acknowledged
-        # !!! sender window only advances by n if ALL clients have ACKed first n sequence numbers in window !!!
+        # !!! sender window only advances by n if ALL clients have ACKed first n sequence numbers in client window !!!
         last_ack_rcvd_from_client = dict()
         for client in registered_clients_addr:
             last_ack_rcvd_from_client[client] = -1      # sequence number -1 indicates no acknowledged packet
@@ -162,19 +162,20 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
             # sending part of server Go-Back-N
             #####################################################################################################
 
-            # iteratively sending all packets with sequence number in current sender window...
+            # iteratively broadcast all packets with sequence numbers in current sender window...
             for sqn_nr in range(window_base, window_end + 1):
-                # ...to all clients registered at the server
-                for registered_client in registered_clients_addr:
-                    # construct segment payload, packaged with checksum and sequence number metadata (pseudo-header)
-                    sender_checksum = unreliable_network.checksum(
-                                        sqn_nr.to_bytes(1, byteorder=sys.byteorder) + data_chunks[sqn_nr]).encode()
-                    encoded_sqn_nr = sqn_nr.to_bytes(1, byteorder=sys.byteorder)
-                    byte_message = (sender_checksum + ":".encode() +
-                                    encoded_sqn_nr + ":".encode()
-                                    + data_chunks[sqn_nr])
 
-                    # try sending sequenced packet via underlying (unreliable) network stack to client
+                # packet construction
+                # -> package payload with checksum and sequence number metadata (pseudo-headers)
+                encoded_sqn_nr = sqn_nr.to_bytes(1, byteorder=sys.byteorder)
+                sender_checksum = unreliable_network.checksum(encoded_sqn_nr + data_chunks[sqn_nr]).encode()
+                byte_message = (sender_checksum + ":".encode() +
+                                encoded_sqn_nr + ":".encode()
+                                + data_chunks[sqn_nr])
+
+                # ...to all clients registered at server
+                for registered_client in registered_clients_addr:
+                    # try sending prepared packet via underlying (unreliable) network to client
                     was_sent = unreliable_network.prob_send(server_socket, byte_message, registered_client, failure_probability)
 
                     # if packet sending was successful, update sending statistics
@@ -185,9 +186,9 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
                         packets_sent += 1
 
                     # for each client, start timer for each packet sent
-                    # -> expiration of packet timer (timeout) without its ACK triggers retransmission of pipelined
+                    # -> expiration of packet timer (timeout) without arrived ACK triggers retransmission of remaining
                     #    packets, i.e. the timed-out packet and all higher-sequence-number packets in usable window
-                    # -> arrival of ACK before timeout does not trigger any reaction by retransmission_handler function
+                    # -> arrival of ACK before timeout cancels any reaction by retransmission_handler function
                     client_packet_timer = threading.Timer(
                         15,
                         retransmission_handler_gbn,
@@ -203,52 +204,55 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
             try:
                 # receipt of acknowledgment (ACK) messages from registered client processes within socket timeout
                 server_socket.settimeout(timeout_s)
-                client_message_data, ack_client_addr = server_socket.recvfrom(4096)
+                client_message_data, acking_client_addr = server_socket.recvfrom(4096)
 
                 # analyse content of client message
                 client_message_fields = client_message_data.decode().split(":", 2)
                 sender_checksum = client_message_fields[0]
-                ack_sqn_nr = client_message_fields[1]
+                acked_sqn_nr = client_message_fields[1]
+                client_payload = client_message_fields[2]
 
-                recv_checksum = unreliable_network.checksum(ack_sqn_nr.encode() + client_message_fields[2].encode())
                 # check whether ACK message was not corrupted by unreliable network channel
+                recv_checksum = unreliable_network.checksum(acked_sqn_nr.encode() + client_payload.encode())
+
                 if sender_checksum == recv_checksum:
-                    # acknowledge received ACK sequence number for that client, if it is NOT an "outdated" ACK !!!
-                    if int(ack_sqn_nr) > last_ack_rcvd_from_client[ack_client_addr]:
-                        # update entry of highest sequence number acknowledged for that client
+                    # record received ACK sequence number for ACKing client, only IF NOT an "outdated" ACK !!!
+                    if int(acked_sqn_nr) > last_ack_rcvd_from_client[acking_client_addr]:
+                        # update entry of highest, in-order sequence number acknowledged by that client
                         # -> Go-Back-N uses "cumulative acknowledgment" scheme
-                        last_ack_rcvd_from_client[ack_client_addr] = int(ack_sqn_nr)
-                        print(f"Received ACK up to file part {ack_sqn_nr}/{len(data_chunks)} "
-                              f"from client {ack_client_addr[0]}:{ack_client_addr[1]}.")
+                        last_ack_rcvd_from_client[acking_client_addr] = int(acked_sqn_nr)
+                        print(f"Received ACK up to file part {acked_sqn_nr}/{len(data_chunks)} "
+                              f"from client {acking_client_addr[0]}:{acking_client_addr[1]}.")
             except socket.timeout:
                 print("")
                 print(f"Resending packets after {timeout_s}s waiting for ACK messages from clients ...")
                 print("")
 
             #####################################################################################################
-            # window management and transmission termination
+            # sliding window management and transmission termination
             #####################################################################################################
 
             # Go-Back-N uses "cumulative acknowledgment" scheme
-            # -> sliding window synchronisation among clients is custom property required here
+            # -> sliding window synchronisation among clients is custom property required here !!!
             advance_window = True
             while advance_window:
-                # check whether ALL clients have ACKed sequence number higher or equal to current window base
+                # check whether ALL clients have ACKed a sequence number higher or equal to current window base...
                 for client in last_ack_rcvd_from_client:
-                    # if one client-specific sequence number is smaller than window base, do not shift window frame
+                    # if one client-specific ACK sequence number is smaller than window base, do not shift window frame
                     if last_ack_rcvd_from_client[client] < window_base:
                         advance_window = False
                         break
 
+                # ... if all client-specific ACK sequence numbers greater than or equal to window base, advance window
                 if advance_window:
-                    # shift sender window one to the right
+                    # shift sender window one to the right (slide to next data chunk)
                     window_base += 1
                     window_end = min(window_base + window_size - 1, len(data_chunks) - 1)
 
             # check whether all clients successfully downloaded all file data chunks to possibly exit communication loop
             download_finished = True
             for client in last_ack_rcvd_from_client:
-                # only if all clients have ACKed last sequence number, file transmission is complete
+                # only if ALL clients have ACKed last sequence number, file transmission is complete
                 if last_ack_rcvd_from_client[client] != (len(data_chunks) - 1):
                     # download is NOT finished if a single client did not acknowledge last sequence number
                     download_finished = False
@@ -257,10 +261,15 @@ def run_server(process_id, expected_clients_nr, file_name, failure_probability, 
             if download_finished:
                 break
 
-        # inform clients that download is complete and session shall be terminated
-        closing_message = f"terminate_session"
-        for client_addr in registered_clients_addr:
-            server_socket.sendto(closing_message.encode(), client_addr)
+        # inform clients that download is now complete and session will be terminated
+        # -> program terminates when server process was terminated
+        closing_indicator = "12345".encode()
+        closing_payload = "DOWNLOAD_COMPLETE".encode()
+        closing_checksum = unreliable_network.checksum(closing_indicator + closing_payload)
+        byte_closing_message = closing_checksum + ":".encode() + closing_indicator + ":".encode() + closing_payload
+
+        for client in registered_clients_addr:
+            server_socket.sendto(byte_closing_message, client)
 
         # release system resources by closing socket after file transmission and communicate termination (+ statistics)
         server_socket.close()
